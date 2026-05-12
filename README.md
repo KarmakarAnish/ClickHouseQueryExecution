@@ -6,9 +6,16 @@
 ![Built From Source](https://img.shields.io/badge/Built%20From-Source-blue?style=flat)
 ![Status](https://img.shields.io/badge/Status-Complete-success?style=flat)
 
-> Not a tutorial. Not documentation. A reverse-engineering journal of how one of the world's fastest database engines executes queries — from source code to controlled experiments.
+> Not a tutorial. Not documentation.  
+> A reverse-engineering journal of how one of the world's fastest database engines executes queries — from source code to controlled experiments.
 
 ---
+
+## Problem Statement
+
+ClickHouse is a high-performance analytical database designed to execute large SQL queries over columnar data with very low latency. In OLAP workloads, the main challenge is not only storing large volumes of data, but also reading, filtering, transforming, aggregating, and returning results efficiently.
+
+This project studies the **ClickHouse Query Execution Pipeline**: the part of ClickHouse that takes a SQL query and turns it into executable processors that scan data, apply expressions, filter rows, aggregate results, sort, limit, and return the final output.
 
 While MergeTree handles the storage of data on disk, **ClickHouse's Query Execution Pipeline** is what actually processes that data at breakneck speeds. ClickHouse uses a **vectorized query execution engine**, meaning it processes data in chunks/blocks of columns rather than row-by-row.
 
@@ -30,16 +37,16 @@ The main execution path studied is:
 
 ```text
 SQL text
-  -> Parser
-  -> AST
-  -> Analyzer
-  -> Query Tree
-  -> Planner
-  -> Query Plan
-  -> Query Pipeline
-  -> Processors
-  -> Pipeline Executor
-  -> Result
+-> Parser
+-> AST
+-> Analyzer
+-> Query Tree
+-> Planner
+-> Query Plan
+-> Query Pipeline
+-> Processors
+-> Pipeline Executor
+-> Result
 ```
 
 This project does **not** deeply analyze:
@@ -69,29 +76,129 @@ flowchart LR
 
 ---
 
+## High-Level Source File Trace
+
+This is a **file-level trace**, not a function-by-function walkthrough. The goal is to connect each major execution phase to the source areas responsible for that phase.
+
+| Execution Stage | Main Source Area / File | Role in the Query Path |
+|---|---|---|
+| SQL parsing | `src/Parsers/ParserSelectQuery.cpp` | Parses SQL text and creates the initial AST representation of the query. |
+| AST representation | `src/Parsers/ASTSelectQuery.*` and related AST classes | Stores the syntactic structure of the SQL query before semantic analysis. |
+| Analyzer / query-tree construction | `src/Interpreters/InterpreterSelectQueryAnalyzer.cpp` | Converts the parsed query into a richer query tree and prepares it for planning. |
+| Analyzer passes and rewrites | `src/Analyzer/` and related interpreter/analyzer files | Applies semantic resolution and query rewrites such as column pruning, expression simplification, and query normalization. |
+| Planning | `src/Planner/` and `src/Processors/QueryPlan/` | Converts the analyzed query tree into a logical/physical query plan made of plan steps. |
+| MergeTree reading | `src/Processors/QueryPlan/ReadFromMergeTree.cpp` | Builds the read stage for MergeTree tables and decides how many read streams are used. |
+| PREWHERE optimization | `src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp` | Tries to move suitable filters from `WHERE` into `PREWHERE` so unnecessary columns/rows can be avoided earlier. |
+| Expression analysis | `src/Interpreters/ExpressionAnalyzer.cpp` | Handles expression actions and early expression simplifications such as constant folding. |
+| Expression execution | `src/Processors/Transforms/ExpressionTransform.cpp` | Executes expression actions over blocks/chunks during pipeline execution. |
+| Processor abstraction | `src/Processors/IProcessor.h` | Defines the processor model used by ClickHouse pipelines. |
+| Pipeline execution | `src/Processors/Executors/PipelineExecutor.cpp` | Schedules and runs processors until the query result is produced. |
+
+The important idea is that ClickHouse does not directly execute SQL text. It gradually lowers the query through multiple internal forms:
+
+```text
+SQL text -> AST -> Query Tree -> Query Plan -> Query Pipeline -> Processors
+```
+
+Each lowering stage removes ambiguity and prepares the query for efficient execution.
+
+---
+
+## Design Decisions and Tradeoffs
+
+### 1. Vectorized block-based execution instead of row-by-row execution
+
+| Aspect | Explanation |
+|---|---|
+| **Where it appears in code** | Processor and transform layers, especially files such as `IProcessor.h`, `ExpressionTransform.cpp`, and query pipeline executor files. |
+| **Problem solved** | Analytical queries often process millions or billions of rows. Processing blocks of column values reduces per-row overhead and makes CPU/cache usage more efficient. |
+| **Tradeoff introduced** | Operators must handle blocks/chunks correctly. Memory management becomes more complex because intermediate column blocks must be created, passed, transformed, and sometimes copied. |
+| **Experiment connection** | Experiment 4 shows that extra expression work on blocks increases CPU time even when the same rows and bytes are read. |
+
+### 2. Query lowering through AST, Query Tree, Query Plan, and Query Pipeline
+
+| Aspect | Explanation |
+|---|---|
+| **Where it appears in code** | `ParserSelectQuery.cpp`, analyzer/interpreter files, planner files, and `src/Processors/QueryPlan/`. |
+| **Problem solved** | SQL is high-level and declarative. ClickHouse needs intermediate representations so parsing, semantic analysis, optimization, planning, and execution can be handled separately. |
+| **Tradeoff introduced** | The system becomes harder to understand because the same query exists in multiple forms. Debugging requires knowing which stage produced which representation. |
+| **Experiment connection** | Experiments 2 and 3 modify optimization behavior before or during planning/expression preparation, showing that earlier stages affect final execution cost. |
+
+### 3. Processor-based execution pipeline
+
+| Aspect | Explanation |
+|---|---|
+| **Where it appears in code** | `src/Processors/IProcessor.h`, `src/Processors/Transforms/`, `src/Processors/Executors/PipelineExecutor.cpp`. |
+| **Problem solved** | Query execution can be represented as a graph of operators: read, expression, filter, aggregate, sort, limit, and output. This allows streaming and parallel execution. |
+| **Tradeoff introduced** | Scheduling and coordination become more complex. Some processors can run in parallel, while others must wait for merging, sorting, aggregation, or final result production. |
+| **Experiment connection** | Experiment 1 exposes how changing read parallelism affects runtime even when the same amount of data is read. |
+
+### 4. Parallel read streams from MergeTree
+
+| Aspect | Explanation |
+|---|---|
+| **Where it appears in code** | `src/Processors/QueryPlan/ReadFromMergeTree.cpp`. |
+| **Problem solved** | Large scans can be divided into multiple streams so different parts of the data are read and processed in parallel. This improves throughput for large analytical queries. |
+| **Tradeoff introduced** | More parallelism can increase CPU scheduling overhead and memory pressure. Too little parallelism underuses hardware; too much parallelism may not always help. |
+| **Experiment connection** | Experiment 1 forced read streams to one and observed slower execution while `read_rows` and `read_bytes` remained the same. |
+
+### 5. PREWHERE-based early filtering
+
+| Aspect | Explanation |
+|---|---|
+| **Where it appears in code** | `src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp`. |
+| **Problem solved** | For suitable queries, ClickHouse can apply filters earlier and avoid reading unnecessary columns/rows. This is especially useful in columnar storage. |
+| **Tradeoff introduced** | The optimizer must decide which filters are safe and beneficial to move. Incorrect or overly aggressive movement could harm performance or complicate correctness. |
+| **Experiment connection** | Experiment 2 blocked automatic `WHERE -> PREWHERE` movement and observed higher read volume and slower runtime. |
+
+### 6. Early constant folding and expression simplification
+
+| Aspect | Explanation |
+|---|---|
+| **Where it appears in code** | `src/Interpreters/ExpressionAnalyzer.cpp`. |
+| **Problem solved** | Constant expressions do not need to be recomputed repeatedly during execution. Simplifying them early reduces CPU work. |
+| **Tradeoff introduced** | More optimization logic is added before execution. Some optimizations may add planning overhead, and the engine must carefully preserve semantics. |
+| **Experiment connection** | Experiment 3 disabled early constant folding and showed slower execution without changing scan volume. |
+
+---
+
+## Concept Mapping to Big Data Engineering
+
+| Big Data Engineering Concept | ClickHouse Connection | Evidence from This Project |
+|---|---|---|
+| **Columnar storage** | ClickHouse stores and reads data column-wise, which enables selective column reads and early filtering optimizations. | PREWHERE pushdown in Experiment 2 reduced `read_bytes` because fewer unnecessary column values had to be read early. |
+| **DAG / pipeline execution** | Query execution is represented as connected processors and transforms, similar to an execution graph. | The query moves from Query Plan to Query Pipeline and then through processors such as reads, expressions, filters, and transforms. |
+| **Parallel processing** | Large scans can be split into multiple read streams and processed concurrently. | Experiment 1 restricted read parallelism and caused the same data scan to become slower. |
+| **Predicate pushdown / early filtering** | Filters can be moved closer to the scan stage using PREWHERE. | Experiment 2 blocked `WHERE -> PREWHERE` movement and increased read work. |
+| **Query optimization** | The analyzer/planner rewrites and simplifies queries before execution. | Experiment 3 disabled early constant folding and showed higher CPU cost. |
+| **Resource management** | Execution speed depends on CPU, memory, number of streams, and intermediate blocks. | Experiments 1, 3, and 4 show that changing CPU-side execution behavior changes runtime even when read volume is unchanged. |
+| **Tradeoff-based system design** | ClickHouse chooses performance-oriented designs that introduce complexity. | Vectorized execution, processor pipelines, PREWHERE movement, and analyzer rewrites improve speed but make the system harder to trace and debug. |
+
+---
+
 ## Repository Structure
 
 ```text
 ClickHouse-Query-Execution/
 │
-├── 📁 Experiments/
-│   ├── QEE1.png                            # Code modification for read parallelism
-│   ├── QEE2-I.png                          # Code modification for PREWHERE pushdown in function 1
-│   ├── QEE2-II.png                         # Code modification for PREWHERE pushdown in function 2
-│   ├── QEE3.png                            # Code modification for early constant folding
-│   └── QEE4.png                            # Code modification for extra expression evaluation
+├── Experiments/
+│   ├── QEE1.png       # Code modification for read parallelism
+│   ├── QEE2-I.png     # Code modification for PREWHERE pushdown in function 1
+│   ├── QEE2-II.png    # Code modification for PREWHERE pushdown in function 2
+│   ├── QEE3.png       # Code modification for early constant folding
+│   └── QEE4.png       # Code modification for extra expression evaluation
 │
-├── 📁 Graphs/
-│   ├── GE1.png                         # Bar Diagram for result of read parallelism
-│   ├── GE2.png                         # Bar Diagram for result of PREWHERE pushdown
-│   ├── GE3.png                         # Bar Diagram for result of early constant folding
-│   └── GE4.png                         # Bar Diagram for result of extra expression evaluation
+├── Graphs/
+│   ├── GE1.png        # Bar Diagram for result of read parallelism
+│   ├── GE2.png        # Bar Diagram for result of PREWHERE pushdown
+│   ├── GE3.png        # Bar Diagram for result of early constant folding
+│   └── GE4.png        # Bar Diagram for result of extra expression evaluation
 │
-├── 📁 Results/                      # Result images for each experiment
-│   ├── QER1.png                     # Exp 1 results
-│   ├── QER2.png                     # Exp 2 results
-│   ├── QER3.png                     # Exp 3 results
-│   └── QER4.png                     # Exp 4 results
+├── Results/           # Result images for each experiment
+│   ├── QER1.png       # Exp 1 results
+│   ├── QER2.png       # Exp 2 results
+│   ├── QER3.png       # Exp 3 results
+│   └── QER4.png       # Exp 4 results
 │
 └── README.md
 ```
@@ -131,7 +238,7 @@ const size_t num_streams = 1;
 **Experiment outcome:**
 
 | Metric | Parallelism On | Parallelism Off |
-|---|---|---|
+|---|---:|---:|
 | `query_ms` | 811 | 1422 |
 | `read_rows` | 50 mil | 50 mil |
 | `read_bytes` | 1.30 GB | 1.30 GB |
@@ -151,13 +258,17 @@ src/Storages/MergeTree/MergeTreeWhereOptimizer.cpp
 **Function 1:**
 
 ```cpp
-void MergeTreeWhereOptimizer::optimize(SelectQueryInfo & select_query_info, const ContextPtr & context) const
+void MergeTreeWhereOptimizer::optimize(
+    SelectQueryInfo & select_query_info,
+    const ContextPtr & context) const
 ```
 
 **Change:** add an early return at the top of the function.
 
 ```cpp
-void MergeTreeWhereOptimizer::optimize(SelectQueryInfo & select_query_info, const ContextPtr & context) const
+void MergeTreeWhereOptimizer::optimize(
+    SelectQueryInfo & select_query_info,
+    const ContextPtr & context) const
 {
     /// Query Execution Experiment 2:
     /// Disable automatic WHERE -> PREWHERE pushdown.
@@ -166,7 +277,6 @@ void MergeTreeWhereOptimizer::optimize(SelectQueryInfo & select_query_info, cons
     return;
 
     auto & select = select_query_info.query->as<ASTSelectQuery &>();
-
     if (!select.where() || select.prewhere())
         return;
 
@@ -177,7 +287,8 @@ void MergeTreeWhereOptimizer::optimize(SelectQueryInfo & select_query_info, cons
 **Function 2:**
 
 ```cpp
-MergeTreeWhereOptimizer::FilterActionsOptimizeResult MergeTreeWhereOptimizer::optimize(
+MergeTreeWhereOptimizer::FilterActionsOptimizeResult
+MergeTreeWhereOptimizer::optimize(
     const ActionsDAG & filter_dag,
     const std::string & filter_column_name,
     const ContextPtr & context,
@@ -187,7 +298,8 @@ MergeTreeWhereOptimizer::FilterActionsOptimizeResult MergeTreeWhereOptimizer::op
 **Change:** add an early return at the top of this overload too.
 
 ```cpp
-MergeTreeWhereOptimizer::FilterActionsOptimizeResult MergeTreeWhereOptimizer::optimize(
+MergeTreeWhereOptimizer::FilterActionsOptimizeResult
+MergeTreeWhereOptimizer::optimize(
     const ActionsDAG & filter_dag,
     const std::string & filter_column_name,
     const ContextPtr & context,
@@ -210,7 +322,7 @@ This change does **not** remove the filter. It only prevents ClickHouse from mov
 **Experiment Outcome:**
 
 | Metric | Pushdown Used | Pushdown Blocked |
-|---|---|---|
+|---|---:|---:|
 | `query_ms` | 10 | 87 |
 | `read_bytes` | 5.2 MB | 67.21 MB |
 | `read_rows` / `selected_rows` | 250k | 5 mil |
@@ -243,15 +355,16 @@ return false;
 **Experiment Outcome:**
 
 | Metric | Expression Optimized | Expression Not Optimized |
-|---|---|---|
-| `query_ms` | 34 | 87
-| `read_rows` | ~5 mil | ~5 mil
-| `read_bytes` | 67.21 MB | 67.21 MB
-| `selected_marks` | 617 | 617
+|---|---:|---:|
+| `query_ms` | 34 | 87 |
+| `read_rows` | ~5 mil | ~5 mil |
+| `read_bytes` | 67.21 MB | 67.21 MB |
+| `selected_marks` | 617 | 617 |
 
 ![](./Graphs/GE3.png)
 
 This does not disable every expression optimization in ClickHouse. It specifically disables **early constant folding**.
+
 ---
 
 ### Experiment 4 — Force Extra Expression Evaluation Cleanly
@@ -283,7 +396,6 @@ void ExpressionTransform::transform(Chunk & chunk)
     {
         auto extra_block = block;
         size_t extra_num_rows = num_rows;
-
         expression->execute(
             extra_block,
             extra_num_rows,
@@ -309,13 +421,13 @@ void ExpressionTransform::transform(Chunk & chunk)
 
 **Experiment Outcome:**
 
-| Metric | Extra Expression Evaluation | Normal Expression
-|---|---|---|
-| `query_ms` | 81 | 43
-| `read_rows` | ~5 mil | ~5 mil
-| `read_bytes` | 67.21 MB | 67.21 MB
-| `selected_rows` | ~5 mil | ~5 mil
-| `selected_marks` | 617 | 617
+| Metric | Extra Expression Evaluation | Normal Expression |
+|---|---:|---:|
+| `query_ms` | 81 | 43 |
+| `read_rows` | ~5 mil | ~5 mil |
+| `read_bytes` | 67.21 MB | 67.21 MB |
+| `selected_rows` | ~5 mil | ~5 mil |
+| `selected_marks` | 617 | 617 |
 
 ![](./Graphs/GE4.png)
 
@@ -347,7 +459,8 @@ sudo apt-get install -y cmake ninja-build clang-14 libssl-dev
 git clone --recursive https://github.com/ClickHouse/ClickHouse.git raw/ClickHouse
 cd raw/ClickHouse
 
-# Step 3 — Apply the source code modification for one experiment only from the above (or in the photos given in this repo)
+# Step 3 — Apply the source code modification for one experiment only
+# from the above or from the photos given in this repo.
 
 # Step 4 — Create the build directory and compile
 mkdir -p build && cd build
@@ -368,23 +481,86 @@ ninja clickhouse-server clickhouse-client
 | **Exp 3: Disable Early Constant Folding** | Heavy constant expressions with and without early folding. | Same read volume, higher CPU/query time. |
 | **Exp 4: Extra Expression Evaluation** | Extra expression execution on copied block vs normal execution. | Same read volume, higher CPU/query time. |
 
-
 ---
 
 ## Numbers That Matter
 
-| Experiment | Finding | Value | 
+| Experiment | Finding | Value |
 |---------|-------|------------|
-| Exp 1 | Slower execution without parallel read streams | **1.75× slower**: 1422 ms vs 811 ms | 
-| Exp 2 | Blocking early PREWHERE filtering increases read work | **~67.21 MiB vs ~5.20 MiB** read and **87ms vs 10ms** | 
-|  Exp 3 | Blocking early constant folding increases CPU time | **2.5× slower**: 87 ms vs 34 ms |
+| Exp 1 | Slower execution without parallel read streams | **1.75× slower**: 1422 ms vs 811 ms |
+| Exp 2 | Blocking early PREWHERE filtering increases read work | **~67.21 MiB vs ~5.20 MiB** read and **87ms vs 10ms** |
+| Exp 3 | Blocking early constant folding increases CPU time | **2.5× slower**: 87 ms vs 34 ms |
 | Exp 4 | Extra expression evaluation adds CPU overhead | **~2× slower**: 81 ms vs 43 ms |
+
+---
+
+## Failure Analysis
+
+The experiments expose how ClickHouse behaves when execution assumptions are disturbed. This section answers the stress/failure-style questions directly.
+
+### 1. What happens when data size increases significantly?
+
+When the data size grows, the scan stage must read more blocks, the expression/filter stages must process more rows, and aggregation or sorting stages may need more memory. If the query is scan-heavy, parallel read streams become important because a single stream may underuse available CPU and I/O bandwidth.
+
+This is connected to Experiment 1. When read parallelism was restricted, ClickHouse read the same number of rows and bytes, but runtime increased from 811 ms to 1422 ms. This suggests that large scans depend strongly on parallel reading and pipeline throughput.
+
+Expected behavior at larger scale:
+
+- `read_rows` and `read_bytes` increase with data volume.
+- Query time increases if the query must scan more blocks.
+- More read streams can improve throughput until CPU, memory bandwidth, or disk I/O becomes the bottleneck.
+- Memory-heavy operators such as aggregation, sorting, and joins may fail if memory limits are reached.
+
+### 2. What happens under skew?
+
+Skew means the data or keys are unevenly distributed. For example, in a `GROUP BY`, one key may appear far more often than others. Under skew, some processors or aggregation states may receive much more work than others.
+
+Possible effects:
+
+- Parallel workers may become imbalanced.
+- Some aggregation states may become much larger.
+- Runtime may be dominated by the slowest overloaded processor.
+- Memory pressure can increase if one group or partition becomes very large.
+
+ClickHouse's pipeline model helps parallelize execution, but skew can still reduce the benefit of parallelism because not all streams perform equal work.
+
+### 3. What happens if an execution component becomes expensive?
+
+Experiment 4 simulates this by forcing extra expression evaluation. The query reads the same amount of data, but runtime increases because the expression transform does extra CPU work.
+
+This shows that query performance is not determined only by storage reads. Even after data is read efficiently, CPU-heavy expression evaluation can become a bottleneck.
+
+### 4. What assumptions does this system rely on?
+
+ClickHouse query execution relies on several practical assumptions:
+
+- Queries are usually analytical and scan many rows but relatively fewer columns.
+- Columnar reads and early filtering can reduce unnecessary work.
+- Blocks/chunks are large enough to benefit from vectorized processing.
+- Parallelism improves throughput when hardware resources are available.
+- Optimizer decisions such as PREWHERE movement and constant folding are usually beneficial.
+- Intermediate memory usage remains within configured resource limits.
+
+If these assumptions fail, performance can degrade. For example, if filters cannot be pushed down, ClickHouse may read more data. If expressions are expensive, CPU can dominate. If data is skewed, parallel execution may become imbalanced.
+
+---
+
+## What the Experiments Demonstrate
+
+| Experiment | System Behavior Isolated | Main Lesson |
+|---|---|---|
+| Exp 1 | Read parallelism | Parallel streams improve throughput for large scans. |
+| Exp 2 | PREWHERE filter pushdown | Early filtering reduces unnecessary read work. |
+| Exp 3 | Early constant folding | Analyzer-level simplification reduces repeated CPU work. |
+| Exp 4 | ExpressionTransform CPU cost | Execution transforms can become bottlenecks even when read volume is unchanged. |
+
+Together, these experiments show that ClickHouse performance comes from the interaction of storage-aware reading, query optimization, pipeline parallelism, and efficient CPU execution.
 
 ---
 
 ## Conclusion
 
-This project reverse-engineered the ClickHouse Query Execution Pipeline by tracing the source code and modifying selected execution paths.
+This project reverse-engineered the ClickHouse Query Execution Pipeline by tracing the source code at a file level and modifying selected execution paths.
 
 | Experiment | Property Exposed | Observed / Expected Impact |
 |---|---|---|
@@ -394,5 +570,7 @@ This project reverse-engineered the ClickHouse Query Execution Pipeline by traci
 | Exp 4: Extra Expression Evaluation | ExpressionTransform contributes direct CPU cost | Extra expression work increased runtime while read volume should remain unchanged. |
 
 ClickHouse's execution speed is not only about the MergeTree storage format. It also depends heavily on its staged query lowering process, vectorized processor pipeline, read parallelism, analyzer optimizations, PREWHERE filtering, and efficient expression transforms.
+
+The main system-design insight is that ClickHouse gains speed by doing less unnecessary work as early as possible and by executing the remaining work in parallel, vectorized blocks. The tradeoff is implementation complexity: the query passes through several internal representations, and performance depends on many interacting components.
 
 ---
