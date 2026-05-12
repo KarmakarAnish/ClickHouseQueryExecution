@@ -317,7 +317,7 @@ MergeTreeWhereOptimizer::optimize(
 
 **Why this is the correct code change:**
 
-This change does **not** remove the filter. It only prevents ClickHouse from moving the filter from `WHERE` into `PREWHERE`. The query result should remain correct, but ClickHouse loses the early-filtering advantage of PREWHERE.
+This change does **not** remove the filter. It only prevents ClickHouse from moving the filter from `WHERE` into `PREWHERE`. The query result remains correct, but ClickHouse loses the early-filtering advantage of PREWHERE.
 
 **Experiment Outcome:**
 
