@@ -75,16 +75,23 @@ flowchart LR
 ClickHouse-Query-Execution/
 │
 ├── 📁 Experiments/
-│   ├── QEE1.png                         # Code modification for read parallelism
-│   ├── QEE2.png                         # Code modification for PREWHERE pushdown
-│   ├── QEE3.png                         # Code modification for early constant folding
-│   └── QEE4.png                         # Code modification for extra expression evaluation
+│   ├── QEE1.png                            # Code modification for read parallelism
+│   ├── QEE2-I.png                          # Code modification for PREWHERE pushdown in function 1
+│   ├── QEE2-II.png                         # Code modification for PREWHERE pushdown in function 2
+│   ├── QEE3.png                            # Code modification for early constant folding
+│   └── QEE4.png                            # Code modification for extra expression evaluation
+│
+├── 📁 Graphs/
+│   ├── GE1.png                         # Bar Diagram for result of read parallelism
+│   ├── GE2.png                         # Bar Diagram for result of PREWHERE pushdown
+│   ├── GE3.png                         # Bar Diagram for result of early constant folding
+│   └── GE4.png                         # Bar Diagram for result of extra expression evaluation
 │
 ├── 📁 Results/                      # Result images for each experiment
-│   ├── Screenshot 2026-05-12 013922.png # Exp 1 results
-│   ├── Screenshot 2026-05-12 014246.png # Exp 2 results
-│   ├── Screenshot 2026-05-12 014532.png # Exp 3 results
-│   └── Screenshot 2026-05-12 014652.png # Exp 4 results
+│   ├── QER1.png                     # Exp 1 results
+│   ├── QER2.png                     # Exp 2 results
+│   ├── QER3.png                     # Exp 3 results
+│   └── QER4.png                     # Exp 4 results
 │
 └── README.md
 ```
@@ -121,13 +128,15 @@ src/Processors/QueryPlan/ReadFromMergeTree.cpp
 const size_t num_streams = 1;
 ```
 
-**Expected behavior:**
+**Experiment outcome:**
 
 | Metric | Parallelism On | Parallelism Off |
 |---|---|---|
 | `query_ms` | 811 | 1422 |
 | `read_rows` | 50 mil | 50 mil |
 | `read_bytes` | 1.30 GB | 1.30 GB |
+
+![](./Graphs/GE1.png)
 
 ---
 
@@ -198,13 +207,15 @@ MergeTreeWhereOptimizer::FilterActionsOptimizeResult MergeTreeWhereOptimizer::op
 
 This change does **not** remove the filter. It only prevents ClickHouse from moving the filter from `WHERE` into `PREWHERE`. The query result should remain correct, but ClickHouse loses the early-filtering advantage of PREWHERE.
 
-**Expected behavior:**
+**Experiment Outcome:**
 
 | Metric | Pushdown Used | Pushdown Blocked |
 |---|---|---|
 | `query_ms` | 10 | 87 |
 | `read_bytes` | 5.2 MB | 67.21 MB |
 | `read_rows` / `selected_rows` | 250k | 5 mil |
+
+![](./Graphs/GE2.png)
 
 ---
 
@@ -229,7 +240,7 @@ allowEarlyConstantFolding(...)
 return false;
 ```
 
-**Expected behavior:**
+**Experiment Outcome:**
 
 | Metric | Expression Optimized | Expression Not Optimized |
 |---|---|---|
@@ -237,6 +248,8 @@ return false;
 | `read_rows` | ~5 mil | ~5 mil
 | `read_bytes` | 67.21 MB | 67.21 MB
 | `selected_marks` | 617 | 617
+
+![](./Graphs/GE3.png)
 
 This does not disable every expression optimization in ClickHouse. It specifically disables **early constant folding**.
 ---
@@ -255,7 +268,7 @@ src/Processors/Transforms/ExpressionTransform.cpp
 void ExpressionTransform::transform(Chunk & chunk)
 ```
 
-**Corrected change:** run the extra expression evaluation on a copied block and discard the result.
+**Change:** run the extra expression evaluation on a copied block and discard the result.
 
 ```cpp
 void ExpressionTransform::transform(Chunk & chunk)
@@ -294,7 +307,7 @@ void ExpressionTransform::transform(Chunk & chunk)
 }
 ```
 
-**Expected behavior:**
+**Experiment Outcome:**
 
 | Metric | Extra Expression Evaluation | Normal Expression
 |---|---|---|
@@ -303,6 +316,8 @@ void ExpressionTransform::transform(Chunk & chunk)
 | `read_bytes` | 67.21 MB | 67.21 MB
 | `selected_rows` | ~5 mil | ~5 mil
 | `selected_marks` | 617 | 617
+
+![](./Graphs/GE4.png)
 
 ---
 
