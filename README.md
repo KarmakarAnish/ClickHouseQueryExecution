@@ -78,7 +78,7 @@ flowchart LR
 
 ## High-Level Source File Trace
 
-This is a **file-level trace**, not a function-by-function walkthrough. The goal is to connect each major execution phase to the source areas responsible for that phase.
+The goal is to connect each major execution phase to the source areas responsible for that phase.
 
 | Execution Stage | Main Source Area / File | Role in the Query Path |
 |---|---|---|
